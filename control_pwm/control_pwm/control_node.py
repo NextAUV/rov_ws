@@ -5,12 +5,13 @@ import serial
 import numpy as np
 import time
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+from geometry_msgs.msg import Twist
 
-qos = QoSProfile(
-    reliability=QoSReliabilityPolicy.BEST_EFFORT,
-    history=QoSHistoryPolicy.KEEP_LAST,
-    depth=1
-)
+# qos = QoSProfile(
+#     reliability=QoSReliabilityPolicy.BEST_EFFORT,
+#     history=QoSHistoryPolicy.KEEP_LAST,
+#     depth=1
+# )
 
 
 class ROVPWMController(Node):
@@ -64,12 +65,22 @@ class ROVPWMController(Node):
             time.sleep(0.1)
 
         # --- Subscribers ---
+        # self.create_subscription(
+        #     JoystickData,
+        #     'joystick_data',
+        #     self.joystick_data_callback,
+        #     # qos
+        #     10
+        # )
+
+
         self.create_subscription(
-            JoystickData,
-            'joystick_data',
-            self.joystick_data_callback,
-            qos
+            Twist,
+            'cmd_vel',
+            self.twist_callback,
+            10
         )
+
 
         # --- Main Control Loop Timer ---
         self.control_timer = self.create_timer(0.05, self.run_control_loop) # 20 Hz
@@ -104,6 +115,16 @@ class ROVPWMController(Node):
         if packet != self.last_packet_sent:
             self.get_logger().info(f"Sending PWM: {packet.strip()}")
             self.last_packet_sent = packet
+        
+        self.get_logger().info(
+            "Sending PWM → "
+            f"T1={pwm_values[0]}  "
+            f"T2={pwm_values[1]}  "
+            f"T3={pwm_values[2]}  "
+            f"T4={pwm_values[3]}  "
+            f"T5={pwm_values[4]}  "
+            f"T6={pwm_values[5]}"
+        )
             
         try:
             self.arduino.write(packet.encode('utf-8'))
@@ -122,6 +143,17 @@ class ROVPWMController(Node):
                 self.get_logger().info("Serial port closed.")
             except Exception as e:
                 self.get_logger().error(f"Error while closing serial port: {e}")
+
+    def twist_callback(self, msg):
+        self.thrust_input = np.array([
+            msg.linear.x,   # surge
+            msg.linear.y,   # sway
+            msg.linear.z,   # heave
+            msg.angular.z,  # yaw
+            msg.angular.y,  # pitch
+            msg.angular.x   # roll
+        ])
+
 
 
 def main(args=None):

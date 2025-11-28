@@ -8,11 +8,11 @@ from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import Twist # The standard message for velocity commands
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
-qos = QoSProfile(
-    reliability=QoSReliabilityPolicy.BEST_EFFORT,
-    history=QoSHistoryPolicy.KEEP_LAST,
-    depth=1
-)
+# qos = QoSProfile(
+#     reliability=QoSReliabilityPolicy.BEST_EFFORT,
+#     history=QoSHistoryPolicy.KEEP_LAST,
+#     depth=1
+# )
 
 # Custom handler to process POST requests and publish to ROS 2
 class RosRequestHandler(http.server.SimpleHTTPRequestHandler):
@@ -72,7 +72,7 @@ class WebServerNode(Node):
         super().__init__('web_server_node')
         
         # --- Create the ROS 2 Publisher ---
-        self.publisher_ = self.create_publisher(Twist, 'cmd_vel', qos)
+        self.publisher_ = self.create_publisher(Twist, 'cmd_vel',10)
         self.get_logger().info('ROS 2 Web Server started. Publishing to /cmd_vel.')
 
         # Find the 'web' directory
