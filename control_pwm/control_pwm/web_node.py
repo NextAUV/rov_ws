@@ -67,18 +67,30 @@ class RosRequestHandler(http.server.SimpleHTTPRequestHandler):
         else:
             self.send_error(404, "File Not Found")
 
+# Custom Server class to allow address reuse and threading
+class RosTCPServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
 class WebServerNode(Node):
     def __init__(self):
         super().__init__('web_server_node')
         
         # --- Create the ROS 2 Publisher ---
-        self.publisher_ = self.create_publisher(Twist, 'cmd_vel',10)
+        self.publisher_ = self.create_publisher(Twist, 'cmd_vel', 10)
         self.get_logger().info('ROS 2 Web Server started. Publishing to /cmd_vel.')
 
         # Find the 'web' directory
-        pkg_share_dir = get_package_share_directory('control_pwm')
-        web_dir = os.path.join(pkg_share_dir, 'web')
-        os.chdir(web_dir)
+        try:
+            pkg_share_dir = get_package_share_directory('control_pwm')
+            web_dir = os.path.join(pkg_share_dir, 'web')
+            if os.path.exists(web_dir):
+                os.chdir(web_dir)
+                self.get_logger().info(f"Serving files from: {web_dir}")
+            else:
+                self.get_logger().error(f"Web directory not found at: {web_dir}")
+        except Exception as e:
+             self.get_logger().error(f"Could not setup web directory: {e}")
         
         # --- Pass the node's publisher and logger to the handler ---
         RosRequestHandler.node_logger = self.get_logger()
@@ -86,20 +98,26 @@ class WebServerNode(Node):
         
         # --- Problem 3: Running the Server in a Separate Thread ---
         PORT = 8000
-        # The httpd object will be created but not started in a blocking way
-        self.httpd = socketserver.TCPServer(("", PORT), RosRequestHandler)
-        
-        # Start serve_forever() in a background thread
-        self.server_thread = threading.Thread(target=self.httpd.serve_forever)
-        self.server_thread.daemon = True
-        self.server_thread.start()
-
-        self.get_logger().info(f"HTTP server is running in the background on port {PORT}")
+        try:
+            # The httpd object will be created but not started in a blocking way
+            self.httpd = RosTCPServer(("", PORT), RosRequestHandler)
+            
+            # Start serve_forever() in a background thread
+            self.server_thread = threading.Thread(target=self.httpd.serve_forever)
+            self.server_thread.daemon = True
+            self.server_thread.start()
+            self.get_logger().info(f"HTTP server is running in the background on port {PORT}")
+        except OSError as e:
+            self.get_logger().error(f"Failed to start server on port {PORT}: {e}")
+            # If we can't start the server, we might want to shut down the node or retry
+            # For now, we'll just log the error.
 
     def destroy_node(self):
-        self.get_logger().info("Shutting down the HTTP server.")
-        self.httpd.shutdown() # Properly stop the server
-        self.httpd.server_close()
+        self.get_logger().info("Shutting down the HTTP server...")
+        if hasattr(self, 'httpd'):
+            self.httpd.shutdown() # Properly stop the server
+            self.httpd.server_close()
+        self.get_logger().info("HTTP server shut down.")
         super().destroy_node()
 
 def main(args=None):
