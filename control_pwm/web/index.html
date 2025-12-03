@@ -95,6 +95,39 @@
                 roll: document.getElementById('val-roll'),
             };
 
+            let isServerConnected = false;
+
+            function updateStatus(connected, message) {
+                isServerConnected = connected;
+                statusEl.textContent = message;
+                if (connected) {
+                    statusEl.classList.remove('text-red-500');
+                    statusEl.classList.add('text-green-400');
+                } else {
+                    statusEl.classList.remove('text-green-400');
+                    statusEl.classList.add('text-red-500');
+                }
+            }
+
+            function checkHealth() {
+                fetch('/health')
+                .then(response => {
+                    if (response.ok) {
+                        if (!isServerConnected) {
+                            updateStatus(true, 'Connected');
+                        }
+                    } else {
+                        throw new Error('Health check failed');
+                    }
+                })
+                .catch(error => {
+                    updateStatus(false, 'Disconnected (Server Unreachable)');
+                });
+            }
+
+            // Check health every 2 seconds
+            setInterval(checkHealth, 2000);
+
             function sendData() {
                 const dataString = `${controlState.x.toFixed(2)},${controlState.y.toFixed(2)},${controlState.z.toFixed(2)},${controlState.yaw.toFixed(2)},${controlState.pitch.toFixed(2)},${controlState.roll.toFixed(2)}`;
                 
@@ -103,6 +136,7 @@
                     valElements[key].textContent = controlState[key].toFixed(2);
                 }
                 
+                // Only try to send data if we think we are connected, or to try and force a connection
                 fetch('/data', {
                     method: 'POST',
                     headers: { 'Content-Type': 'text/plain' },
@@ -110,18 +144,20 @@
                 })
                 .then(response => {
                     if (response.ok) {
-                        statusEl.textContent = 'Connected';
-                        statusEl.classList.remove('text-red-500');
-                        statusEl.classList.add('text-green-400');
+                        if (!isServerConnected) {
+                            updateStatus(true, 'Connected');
+                        }
                     } else {
                         throw new Error('Server responded with an error.');
                     }
                 })
                 .catch(error => {
-                    console.error('Connection error:', error);
-                    statusEl.textContent = 'Disconnected';
-                    statusEl.classList.remove('text-green-400');
-                    statusEl.classList.add('text-red-500');
+                    // console.error('Connection error:', error);
+                    // We rely on checkHealth for the main status update to avoid flickering
+                    // but if send fails, we might be disconnected.
+                    if (isServerConnected) {
+                         updateStatus(false, 'Disconnected (Send Failed)');
+                    }
                 });
             }
             

@@ -3,22 +3,27 @@ from rclpy.node import Node
 import http.server
 import socketserver
 import os
-import threading # We need threading to run the server and ROS 2 node together
+import threading
+import time
 from ament_index_python.packages import get_package_share_directory
-from geometry_msgs.msg import Twist # The standard message for velocity commands
+from geometry_msgs.msg import Twist
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-
-# qos = QoSProfile(
-#     reliability=QoSReliabilityPolicy.BEST_EFFORT,
-#     history=QoSHistoryPolicy.KEEP_LAST,
-#     depth=1
-# )
 
 # Custom handler to process POST requests and publish to ROS 2
 class RosRequestHandler(http.server.SimpleHTTPRequestHandler):
     # These will be class-level variables to hold references to the node's components
     node_logger = None
     ros_publisher = None
+
+    def do_GET(self):
+        if self.path == '/health':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b"OK")
+        else:
+            # Serve static files for other GET requests
+            super().do_GET()
 
     def do_POST(self):
         if self.path == '/data':
@@ -27,20 +32,19 @@ class RosRequestHandler(http.server.SimpleHTTPRequestHandler):
                 post_data = self.rfile.read(content_length)
                 data_string = post_data.decode('utf-8')
                 
-                # --- Problem 1: Parsing Data Safely ---
-                # Split the string by commas and convert to numbers
+                # Parsing Data Safely
                 parts = data_string.split(',')
                 if len(parts) != 6:
-                    self.node_logger.warn(f"Received malformed data: expected 6 values, got {len(parts)}")
+                    if self.node_logger:
+                        self.node_logger.warn(f"Received malformed data: expected 6 values, got {len(parts)}")
                     self.send_error(400, "Bad Request: Malformed data")
                     return
                 
                 # Convert all parts to float, safely
                 values = [float(p) for p in parts]
 
-                # --- Problem 2: Creating and Publishing a ROS 2 Message ---
+                # Creating and Publishing a ROS 2 Message
                 if self.ros_publisher:
-                    # Create a Twist message
                     twist_msg = Twist()
                     # Map the UI values to the Twist message fields
                     # [x, y, z, yaw, pitch, roll] from JS
@@ -51,21 +55,27 @@ class RosRequestHandler(http.server.SimpleHTTPRequestHandler):
                     twist_msg.angular.y = values[4] # Pitch
                     twist_msg.angular.x = values[5] # Roll
                     
-                    # Publish the message!
                     self.ros_publisher.publish(twist_msg)
-                    self.node_logger.info(f"Published to /cmd_vel: linear=[{values[0]:.2f}, {values[1]:.2f}, {values[2]:.2f}], angular=[{values[5]:.2f}, {values[4]:.2f}, {values[3]:.2f}]")
+                    # Logging every message can be spammy, maybe log only occasionally or debug
+                    # self.node_logger.debug(f"Published: {values}")
 
                 self.send_response(200)
                 self.end_headers()
 
             except (ValueError, IndexError) as e:
-                self.node_logger.error(f"Could not parse controller data: {e}")
+                if self.node_logger:
+                    self.node_logger.error(f"Could not parse controller data: {e}")
                 self.send_error(400, "Bad Request: Invalid data format")
             except Exception as e:
-                self.node_logger.error(f"An unexpected error occurred: {e}")
+                if self.node_logger:
+                    self.node_logger.error(f"An unexpected error occurred: {e}")
                 self.send_error(500, "Internal Server Error")
         else:
             self.send_error(404, "File Not Found")
+
+    def log_message(self, format, *args):
+        # Override to prevent printing every request to stdout, use ROS logger if needed
+        pass
 
 # Custom Server class to allow address reuse and threading
 class RosTCPServer(socketserver.ThreadingTCPServer):
@@ -76,9 +86,16 @@ class WebServerNode(Node):
     def __init__(self):
         super().__init__('web_server_node')
         
+        # --- QoS Profile for Teleop ---
+        qos_profile = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+
         # --- Create the ROS 2 Publisher ---
-        self.publisher_ = self.create_publisher(Twist, 'cmd_vel', 10)
-        self.get_logger().info('ROS 2 Web Server started. Publishing to /cmd_vel.')
+        self.publisher_ = self.create_publisher(Twist, 'cmd_vel', qos_profile)
+        self.get_logger().info('ROS 2 Web Server started. Publishing to /cmd_vel with Best Effort QoS.')
 
         # Find the 'web' directory
         try:
@@ -96,26 +113,27 @@ class WebServerNode(Node):
         RosRequestHandler.node_logger = self.get_logger()
         RosRequestHandler.ros_publisher = self.publisher_
         
-        # --- Problem 3: Running the Server in a Separate Thread ---
-        PORT = 8000
+        # --- Running the Server in a Separate Thread ---
+        self.port = 8000
+        self.httpd = None
+        self.server_thread = None
+        self.start_server()
+
+    def start_server(self):
         try:
-            # The httpd object will be created but not started in a blocking way
-            self.httpd = RosTCPServer(("", PORT), RosRequestHandler)
-            
-            # Start serve_forever() in a background thread
+            self.httpd = RosTCPServer(("", self.port), RosRequestHandler)
             self.server_thread = threading.Thread(target=self.httpd.serve_forever)
             self.server_thread.daemon = True
             self.server_thread.start()
-            self.get_logger().info(f"HTTP server is running in the background on port {PORT}")
+            self.get_logger().info(f"HTTP server is running in the background on port {self.port}")
         except OSError as e:
-            self.get_logger().error(f"Failed to start server on port {PORT}: {e}")
-            # If we can't start the server, we might want to shut down the node or retry
-            # For now, we'll just log the error.
+            self.get_logger().error(f"Failed to start server on port {self.port}: {e}")
+            # Retry logic could go here, but for now we just log it.
 
     def destroy_node(self):
         self.get_logger().info("Shutting down the HTTP server...")
-        if hasattr(self, 'httpd'):
-            self.httpd.shutdown() # Properly stop the server
+        if self.httpd:
+            self.httpd.shutdown()
             self.httpd.server_close()
         self.get_logger().info("HTTP server shut down.")
         super().destroy_node()
@@ -129,7 +147,8 @@ def main(args=None):
         pass
     finally:
         web_server_node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

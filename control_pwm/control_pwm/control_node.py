@@ -7,13 +7,6 @@ import time
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 from geometry_msgs.msg import Twist
 
-# qos = QoSProfile(
-#     reliability=QoSReliabilityPolicy.BEST_EFFORT,
-#     history=QoSHistoryPolicy.KEEP_LAST,
-#     depth=1
-# )
-
-
 class ROVPWMController(Node):
     """
     This node subscribes to joystick data, calculates thruster PWM values
@@ -23,24 +16,19 @@ class ROVPWMController(Node):
     def __init__(self):
         super().__init__('rov_pwm_controller')
 
-        # --- Initialize attributes FIRST to prevent AttributeError on failed connection ---
+        # --- Initialize attributes FIRST ---
         self.arduino = None
         self.last_packet_sent = ""
         self.control_timer = None
+        self.last_connection_attempt = 0
+        self.connection_retry_interval = 2.0 # Seconds between retries
 
         # --- Parameters ---
         self.declare_parameter('arduino_port', '/dev/ttyACM0')
-        port = self.get_parameter('arduino_port').get_parameter_value().string_value
+        self.port = self.get_parameter('arduino_port').get_parameter_value().string_value
         
-        try:
-            self.arduino = serial.Serial(port, baudrate=115200, timeout=0.1)
-            self.get_logger().info(f"Successfully connected to Arduino on {port}")
-        except serial.SerialException as e:
-            self.get_logger().error(f"Failed to connect to Arduino on {port}: {e}")
-            self.get_logger().error("Shutting down node. Check the port and permissions (e.g., 'sudo chmod a+rw /dev/ttyACM0')")
-            # Return without setting up the rest of the node.
-            # The 'finally' block in main() will still call disarm_motors.
-            return
+        # Initial connection attempt
+        self.connect_arduino()
 
         # --- Thruster Mixing Matrix (6x6) for BlueROV2-style frame ---
         # Maps [surge, sway, heave, roll, pitch, yaw] to 6 thrusters
@@ -56,45 +44,63 @@ class ROVPWMController(Node):
         # --- State ---
         self.thrust_input = np.zeros(6)
         
-        # --- Arming Sequence ---
-        self.get_logger().info("Waiting for Arduino to initialize...")
-        time.sleep(2) # Wait for 2 seconds
-        self.get_logger().info("Sending initial neutral signal.")
-        for _ in range(5):
-            self.send_pwm_packet([1500] * 6)
-            time.sleep(0.1)
+        # --- QoS Profile for Teleop ---
+        # Best Effort: Don't retry lost packets (low latency)
+        # Volatile: Don't save old messages for new subscribers
+        # Keep Last / Depth 1: Only keep the very latest command
+        qos_profile = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1
+        )
 
         # --- Subscribers ---
-        # self.create_subscription(
-        #     JoystickData,
-        #     'joystick_data',
-        #     self.joystick_data_callback,
-        #     # qos
-        #     10
-        # )
-
-
         self.create_subscription(
             Twist,
             'cmd_vel',
             self.twist_callback,
-            10
+            qos_profile
         )
-
 
         # --- Main Control Loop Timer ---
         self.control_timer = self.create_timer(0.05, self.run_control_loop) # 20 Hz
-        self.get_logger().info("ROV PWM Controller Initialized and Armed.")
+        self.get_logger().info("ROV PWM Controller Initialized.")
 
-    def joystick_data_callback(self, msg):
-        """Processes incoming joystick data and maps it to thrust inputs."""
-        self.thrust_input = np.array([
-            msg.x, msg.y, msg.z,
-            msg.yaw, msg.pitch, msg.roll
-        ])
+    def connect_arduino(self):
+        """Attempts to connect to the Arduino."""
+        now = time.time()
+        if now - self.last_connection_attempt < self.connection_retry_interval:
+            return False
+
+        self.last_connection_attempt = now
+        try:
+            if self.arduino and self.arduino.is_open:
+                self.arduino.close()
+            
+            # Added write_timeout to prevent blocking indefinitely
+            self.arduino = serial.Serial(self.port, baudrate=115200, timeout=0.1, write_timeout=0.1)
+            self.get_logger().info(f"Successfully connected to Arduino on {self.port}")
+            
+            # Arming Sequence on connect
+            self.get_logger().info("Waiting for Arduino to initialize...")
+            time.sleep(2) 
+            self.get_logger().info("Sending initial neutral signal.")
+            for _ in range(5):
+                self.send_pwm_packet([1500] * 6)
+                time.sleep(0.1)
+            return True
+        except serial.SerialException as e:
+            self.get_logger().warn(f"Failed to connect to Arduino on {self.port}: {e}. Retrying in {self.connection_retry_interval}s...")
+            self.arduino = None
+            return False
 
     def run_control_loop(self):
         """Calculates and sends PWM signals based on the latest thrust input."""
+        # Check connection
+        if not self.arduino or not self.arduino.is_open:
+            self.connect_arduino()
+            return
+
         thrust_output = self.mixing_matrix @ self.thrust_input
         
         max_thrust = np.max(np.abs(thrust_output))
@@ -106,39 +112,37 @@ class ROVPWMController(Node):
         
     def send_pwm_packet(self, pwm_values):
         """Encodes and sends a list of PWM values to the Arduino."""
-        # This check prevents errors if the serial port was never opened.
         if not self.arduino or not self.arduino.is_open:
             return
 
         packet = ','.join(str(p) for p in pwm_values) + '\n'
         
+        # Only log if changed, to reduce spam
         if packet != self.last_packet_sent:
-            self.get_logger().info(f"Sending PWM: {packet.strip()}")
+            # self.get_logger().info(f"Sending PWM: {packet.strip()}")
             self.last_packet_sent = packet
         
-        self.get_logger().info(
-            "Sending PWM → "
-            f"T1={pwm_values[0]}  "
-            f"T2={pwm_values[1]}  "
-            f"T3={pwm_values[2]}  "
-            f"T4={pwm_values[3]}  "
-            f"T5={pwm_values[4]}  "
-            f"T6={pwm_values[5]}"
-        )
-            
         try:
             self.arduino.write(packet.encode('utf-8'))
+        except serial.SerialTimeoutException:
+             self.get_logger().warn("Serial write timed out. Arduino might be busy or disconnected.")
+             # We might want to trigger a reconnect here if it persists, but for now just warn
         except Exception as e:
             self.get_logger().error(f"Serial write failed: {e}")
+            self.get_logger().warn("Closing serial connection and attempting to reconnect...")
+            try:
+                self.arduino.close()
+            except:
+                pass
+            self.arduino = None
 
     def disarm_motors(self):
         """Sends a neutral signal to all motors and closes the connection."""
         self.get_logger().info("Disarming motors...")
-        # Check if arduino object exists and is open before trying to use it.
         if self.arduino and self.arduino.is_open:
             try:
                 self.send_pwm_packet([1500] * 6)
-                time.sleep(0.1) # Ensure the packet is sent
+                time.sleep(0.1)
                 self.arduino.close()
                 self.get_logger().info("Serial port closed.")
             except Exception as e:
@@ -154,26 +158,20 @@ class ROVPWMController(Node):
             msg.angular.x   # roll
         ])
 
-
-
 def main(args=None):
     rclpy.init(args=args)
     node = ROVPWMController()
     
-    # Only spin if the node was initialized correctly (arduino connected)
-    if node.arduino and node.arduino.is_open:
-        try:
-            rclpy.spin(node)
-        except KeyboardInterrupt:
-            node.get_logger().info("Keyboard interrupt received.")
-        finally:
-            node.get_logger().info("Shutting down from spin.")
-            node.disarm_motors()
-            node.destroy_node()
-    
-    # If initialization failed, rclpy.ok() might still be true, so we clean up.
-    if rclpy.ok():
-        rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info("Keyboard interrupt received.")
+    finally:
+        node.get_logger().info("Shutting down from spin.")
+        node.disarm_motors()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
